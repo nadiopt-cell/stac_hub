@@ -123,7 +123,10 @@ class ThumbWorker(QRunnable):
             # миниатюры MPC лежат в Azure blob — нужна SAS-подпись (иначе 409)
             url = stac_client.sign_url(self.url, (self.meta or {}).get("collection") or "")
             data = stac_client.fetch_thumbnail(url) or b""
-        self.dialog.thumb_signals.ready.emit(self.meta, data)
+        try:
+            self.dialog.thumb_signals.ready.emit(self.meta, data)
+        except RuntimeError:
+            pass  # диалог уже закрыт — слоты уничтожены, тихо выходим
 
 
 class CredentialsDialog(QDialog):
