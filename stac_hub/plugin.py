@@ -129,53 +129,160 @@ class StacHubPlugin(object):
                  'swir', 'agri', 'geo', 'urban', 'ndvi', 'ndwi', 'ndbi',
                  'nbr') или 'plain'/'None' — добавить ассет как есть.
         Возвращает (успех, сообщение).
+
+        Синхронный путь (готовит и добавляет в одном вызове). Для отзывчивого
+        интерфейса используйте пару: prepare_layer() в фоновом потоке +
+        finish_layer() в GUI-потоке — тогда QGIS не замерзает на время
+        сетевых чтений и расчёта индекса.
         """
         try:
-            return self._add_rendered(meta, preset, creds)
+            extent, crs, ctx = self.canvas_build_context()
+            ok, msg, payload = self.prepare_layer(meta, preset, creds, extent, crs, ctx)
+            if not ok:
+                return False, msg
+            return self.finish_layer(payload)
         except Exception as exc:  # noqa: BLE001 - не роняем интерфейс
             return False, "Ошибка построения слоя: {}".format(exc)
 
-    def _add_rendered(self, meta, preset, creds):
+    def canvas_build_context(self):
+        """(экстент карты, CRS, контекст трансформаций) для расчёта индекса.
+
+        Обращается к интерфейсу — вызывать ТОЛЬКО в GUI-потоке (до запуска
+        фонового воркера); результат передаётся в prepare_layer аргументами.
+        """
+        try:
+            canvas = self.iface.mapCanvas()
+            if canvas is None:
+                return None, None, None
+            return (canvas.extent(), canvas.mapSettings().destinationCrs(),
+                    QgsProject.instance().transformContext())
+        except Exception:  # noqa: BLE001 - нет карты/странной сборки
+            return None, None, None
+
+    def prepare_layer(self, meta, preset, creds, canvas_extent=None,
+                      canvas_crs=None, transform_ctx=None):
+        """Тяжёлая часть построения слоя — ВЫПОЛНЯТЬ В ФОНОВОМ ПОТОКЕ.
+
+        Здесь только сеть, GDAL, файлы и расчёты: SAS-подписи, измерения
+        гридов, запись VRT, расчёт индекса QgsRasterCalculator, выборка
+        перцентилей для растяжки. Обращений к QgsProject/интерфейсу нет —
+        поэтому QGIS остаётся отзывчивым.
+
+        Возвращает (ok, msg, payload); payload завершается в finish_layer().
+        """
+        try:
+            return self._prepare(meta, preset, creds, canvas_extent,
+                                 canvas_crs, transform_ctx)
+        except Exception as exc:  # noqa: BLE001 - не роняем поток
+            return False, "Ошибка подготовки слоя: {}".format(exc), None
+
+    def finish_layer(self, payload):
+        """Финал построения — ВЫПОЛНЯТЬ В GUI-ПОТОКЕ.
+
+        Только быстрое: QgsRasterLayer, рендерер (значения растяжки уже
+        посчитаны в prepare_layer), добавление в QgsProject.
+        Возвращает (успех, сообщение).
+        """
+        try:
+            return self._finish(payload)
+        except Exception as exc:  # noqa: BLE001
+            return False, "Ошибка добавления слоя: {}".format(exc)
+
+    def _finish(self, payload):
+        kind = (payload or {}).get("kind")
+        if kind == "plain":
+            layer = QgsRasterLayer(payload["uri"], payload["name"], "gdal")
+            if not layer.isValid():
+                return False, ("Слой недоступен: {} (проверьте сеть/доступ; для защищённых "
+                               "источников задайте учётные данные)").format(
+                                   (payload.get("href") or "")[:120])
+            QgsProject.instance().addMapLayer(layer)
+            return True, payload["name"]
+        if kind == "rgb":
+            layer = QgsRasterLayer(payload["uri"], payload["name"], "gdal")
+            if not layer.isValid():
+                return False, "Слой недоступен: {}".format((payload.get("href") or "")[:100])
+            self._apply_rgb_renderer(layer, payload["band_map"], payload.get("cut"))
+            QgsProject.instance().addMapLayer(layer)
+            return True, payload["name"]
+        if kind == "index":
+            layer = QgsRasterLayer(payload["out_path"], payload["name"], "gdal")
+            if not layer.isValid():
+                return False, "Результат индекса не открылся: {}".format(payload["out_path"])
+            self._apply_index_style(layer, payload["key"])
+            QgsProject.instance().addMapLayer(layer)
+            msg = "Рассчитан {}: {}".format(payload["label"], payload["out_path"])
+            if payload.get("downsampled"):
+                msg += " (грид уменьшен до {} px по большой стороне)".format(INDEX_MAX_SIDE)
+            return True, msg
+        return False, "Неизвестный тип слоя."
+
+    def _prepare(self, meta, preset, creds, canvas_extent, canvas_crs, transform_ctx):
         if not preset or preset == "plain" or (preset == "true_color" and not meta.get("assets")):
-            return self.add_cog_layer(meta.get("asset_url", ""), self._layer_name(meta), creds)
+            return self._prepare_plain(meta, creds)
         rp = render_presets.plan_for(meta.get("assets") or {}, preset)
         if rp is None:
             if preset == "true_color":
                 # синтез недоступен — добавляем выбранный ассет как есть
-                return self.add_cog_layer(meta.get("asset_url", ""), self._layer_name(meta), creds)
+                return self._prepare_plain(meta, creds)
             return False, ("У айтема нет каналов для «{}» "
-                           "(это норм для SAR/DEM/тематических продуктов).").format(preset)
+                           "(это норм для SAR/DEM/тематических продуктов).").format(preset), None
         self._apply_gdal_auth(creds)
         coll = meta.get("collection") or ""
         if preset in {i["key"]: i for i in render_presets.INDICES}:
-            return self._add_index_layer(meta, rp, coll)
-        return self._add_composite_layer(meta, rp, coll)
+            return self._prepare_index(meta, rp, coll, canvas_extent, canvas_crs, transform_ctx)
+        return self._prepare_composite(meta, rp, coll)
+
+    def _prepare_plain(self, meta, creds):
+        self._apply_gdal_auth(creds)
+        url = stac_client.sign_url(meta.get("asset_url", ""),
+                                   meta.get("collection") or "")
+        return True, "", {
+            "kind": "plain",
+            "uri": stac_client.vsicurl_url(url),
+            "name": self._layer_name(meta),
+            "href": url,
+        }
 
     # --------------------------------------------------------- композиты
-    def _add_composite_layer(self, meta, rp, coll):
+    def _prepare_composite(self, meta, rp, coll):
+        """Подготовка RGB-синтеза (фоновый поток): подписи, грид, VRT, статистика.
+
+        Перцентили 2–98% для растяжки берутся из прореженного окна 512×512
+        (GDAL сам использует обзорные уровни COG) — это на порядки меньше
+        сетевого трафика, чем cumulativeCut по полному каналу, и главное —
+        без обращения к GUI-потоку при финализации.
+        """
         plan = rp["plan"]
         name = self._layer_name(meta)
         if plan["mode"] == "single":
             url = stac_client.sign_url(plan["href"], coll)
-            layer = QgsRasterLayer(stac_client.vsicurl_url(url), name, "gdal")
-            if not layer.isValid():
-                return False, "Слой недоступен: {}".format((plan["href"] or "")[:100])
-            self._apply_rgb_renderer(layer, plan["bands"])
-            QgsProject.instance().addMapLayer(layer)
-            return True, ""
+            uri = stac_client.vsicurl_url(url)
+            cut = None
+            if gdal is not None:
+                ds = gdal.Open(uri)
+                if ds is None:
+                    return False, "Слой недоступен: {}".format((plan["href"] or "")[:100]), None
+                cut = {role: _ds_percentiles(ds, band)
+                       for role, band in plan["bands"].items()}
+                ds = None
+            return True, "", {"kind": "rgb", "uri": uri, "name": name,
+                              "band_map": dict(plan["bands"]), "cut": cut,
+                              "href": plan["href"]}
         # стек: по одному одноцветному ассету на канал -> VRT
-        sources, master = [], None
         if gdal is None:
-            return False, "Модуль osgeo.gdal недоступен."
+            return False, "Модуль osgeo.gdal недоступен.", None
+        sources, master, cut = [], None, {}
         for role in rp["roles"]:
             href = stac_client.sign_url(plan["bands"][role]["href"], coll)
             ds = gdal.Open(stac_client.vsicurl_url(href))
             if ds is None:
-                return False, "Канал не читается ({}): {}".format(role, href[:90])
+                return False, "Канал не читается ({}): {}".format(role, href[:90]), None
             if master is None or (ds.RasterXSize * ds.RasterYSize >=
                                   master[0] * master[1]):
                 master = (ds.RasterXSize, ds.RasterYSize,
                           ds.GetGeoTransform(), ds.GetProjection())
+            cut[role] = _ds_percentiles(ds, 1)
             sources.append({
                 "href": stac_client.vsicurl_url(href),
                 "dtype": gdal.GetDataTypeName(ds.GetRasterBand(1).DataType) or "Float32",
@@ -186,16 +293,27 @@ class StacHubPlugin(object):
         vrt_path = _vrt_path(meta, rp)
         with open(vrt_path, "w", encoding="utf-8") as f:
             f.write(render_presets.build_vrt_xml(w, h, gt, proj, sources))
-        layer = QgsRasterLayer(vrt_path, name, "gdal")
-        if not layer.isValid():
-            return False, "Виртуальный слой (VRT) не открылся: {}".format(vrt_path)
-        self._apply_rgb_renderer(layer, {role: i + 1 for i, role in enumerate(rp["roles"])})
-        QgsProject.instance().addMapLayer(layer)
-        return True, ""
+        return True, "", {
+            "kind": "rgb", "uri": vrt_path, "name": name,
+            "band_map": {role: i + 1 for i, role in enumerate(rp["roles"])},
+            "cut": cut, "href": vrt_path,
+        }
+
+    def _add_composite_layer(self, meta, rp, coll):
+        """Совместимость: синхронная сборка композита (prepare + finish)."""
+        ok, msg, payload = self._prepare_composite(meta, rp, coll)
+        if not ok:
+            return False, msg
+        return self._finish(payload)
 
     @staticmethod
-    def _apply_rgb_renderer(layer, band_map):
-        """Мультиканальный рендерер + растяжка 2–98% по каждому каналу."""
+    def _apply_rgb_renderer(layer, band_map, cut=None):
+        """Мультиканальный рендерер + растяжка 2–98% по каждому каналу.
+
+        cut — заранее посчитанные (min, max) по ролям из prepare_layer
+        (фоновый поток); если их нет — fallback на cumulativeCut провайдера
+        (синхронный путь, допустимо для локальных файлов).
+        """
         dp = layer.dataProvider()
         renderer = QgsMultiBandColorRenderer(
             dp, band_map.get("red", 1), band_map.get("green", 2), band_map.get("blue", 3))
@@ -204,7 +322,11 @@ class StacHubPlugin(object):
             if not band:
                 continue
             try:
-                mn, mx = _cumcut(dp, band)
+                pair = (cut or {}).get(role)
+                if pair and pair[1] > pair[0]:
+                    mn, mx = float(pair[0]), float(pair[1])
+                else:
+                    mn, mx = _cumcut(dp, band)
                 enh = QgsContrastEnhancement(dp.dataType(band))
                 enh.setContrastEnhancementAlgorithm(
                     QgsContrastEnhancement.StretchToMinimumMaximum)
@@ -221,24 +343,40 @@ class StacHubPlugin(object):
 
     # ------------------------------------------------------------ индексы
     def _add_index_layer(self, meta, rp, coll):
+        """Совместимость: синхронный расчёт индекса (prepare + finish)."""
+        extent, crs, ctx = self.canvas_build_context()
+        ok, msg, payload = self._prepare_index(meta, rp, coll, extent, crs, ctx)
+        if not ok:
+            return False, msg
+        return self._finish(payload)
+
+    def _prepare_index(self, meta, rp, coll, canvas_extent=None,
+                       canvas_crs=None, transform_ctx=None):
+        """Подготовка слоя индекса (фоновый поток): VRT/ассет + расчёт.
+
+        QgsRasterCalculator читает каналы по сети — именно эта фаза замораживала
+        QGIS на десятки секунд/минуты. Базовый слой здесь не добавляется в
+        проект, поэтому конкурентных чтений из GUI-потока нет. Экстент карты
+        передаётся аргументами (в воркере к интерфейсу обращаться нельзя).
+        """
         if QgsRasterCalculator is None or QgsRasterCalculatorEntry is None:
-            return False, "Модуль qgis.analysis недоступен — индексы нельзя рассчитать."
+            return False, "Модуль qgis.analysis недоступен — индексы нельзя рассчитать.", None
         plan = rp["plan"]
         # базовый слой с каналами индекса (один ассет или VRT)
         if plan["mode"] == "single":
             url = stac_client.sign_url(plan["href"], coll)
             base = QgsRasterLayer(stac_client.vsicurl_url(url), "A", "gdal")
             if not base.isValid():
-                return False, "Каналы индекса не читаются: {}".format((plan["href"] or "")[:90])
+                return False, "Каналы индекса не читаются: {}".format((plan["href"] or "")[:90]), None
         else:
             if gdal is None:
-                return False, "Модуль osgeo.gdal недоступен."
+                return False, "Модуль osgeo.gdal недоступен.", None
             sources, master = [], None
             for role in rp["roles"]:
                 href = stac_client.sign_url(plan["bands"][role]["href"], coll)
                 ds = gdal.Open(stac_client.vsicurl_url(href))
                 if ds is None:
-                    return False, "Канал не читается ({}): {}".format(role, href[:90])
+                    return False, "Канал не читается ({}): {}".format(role, href[:90]), None
                 if master is None or (ds.RasterXSize * ds.RasterYSize >=
                                       master[0] * master[1]):
                     master = (ds.RasterXSize, ds.RasterYSize,
@@ -255,24 +393,23 @@ class StacHubPlugin(object):
                 f.write(render_presets.build_vrt_xml(w, h, gt, proj, sources))
             base = QgsRasterLayer(vrt_path, "A", "gdal")
             if not base.isValid():
-                return False, "Виртуальный слой (VRT) не открылся: {}".format(vrt_path)
+                return False, "Виртуальный слой (VRT) не открылся: {}".format(vrt_path), None
         # ссылки на каналы в выражении
         band_no = {role: (plan["bands"][role] if plan["mode"] == "single" else i + 1)
                    for i, role in enumerate(rp["roles"])}
         ref_a = "A@{}".format(band_no[rp["roles"][0]])
         ref_b = "A@{}".format(band_no[rp["roles"][1]])
         expr = render_presets.index_expression(rp["def"], ref_a, ref_b)
-        # экстент расчёта: вид карты, пересечённый с растром (в CRS растра)
+        # экстент расчёта: вид карты, пересечённый с растром (в CRS растра);
+        # экстент/CRS/контекст захвачены в GUI-потоке заранее (canvas_build_context)
         extent = base.extent()
         downsampled = False
         try:
-            canvas = self.iface.mapCanvas()
-            if canvas is not None:
-                cext = canvas.extent()
-                ccrs = canvas.mapSettings().destinationCrs()
-                if ccrs.authid() != base.crs().authid():
+            if canvas_extent is not None and canvas_crs is not None and transform_ctx is not None:
+                cext = canvas_extent
+                if canvas_crs.authid() != base.crs().authid():
                     cext = QgsCoordinateTransform(
-                        ccrs, base.crs(), QgsProject.instance()).transformBoundingBox(cext)
+                        canvas_crs, base.crs(), transform_ctx).transformBoundingBox(cext)
                 inter = cext.intersect(base.extent())
                 if not inter.isEmpty() and inter.width() > 0 and inter.height() > 0:
                     extent = inter
@@ -289,7 +426,7 @@ class StacHubPlugin(object):
             downsampled = True
         out_dir = os.path.join(tempfile.gettempdir(), "stac_hub_indices")
         if not os.path.isdir(out_dir):
-            os.makedirs(out_dir)
+            os.makedirs(out_dir, exist_ok=True)
         out_path = os.path.join(out_dir, "{}_{}.tif".format(
             rp["def"]["key"], _safe_name(meta.get("item_id", "")) or str(int(time.time()))))
         entries = []
@@ -304,20 +441,18 @@ class StacHubPlugin(object):
         # QGIS 3.x: processCalculation(); страховка для нестандартных сборок
         runner = getattr(calc, "processCalculation", None) or getattr(calc, "run", None)
         if runner is None:
-            return False, "QGIS не предоставляет API расчёта растровых выражений."
+            return False, "QGIS не предоставляет API расчёта растровых выражений.", None
         res = runner()
         if res != getattr(QgsRasterCalculator, "Success", 0):
-            return False, "Расчёт индекса не удался (код {}).".format(res)
-        name = "{} · {}".format(rp["def"]["label"], self._layer_name(meta))
-        layer = QgsRasterLayer(out_path, name, "gdal")
-        if not layer.isValid():
-            return False, "Результат индекса не открылся: {}".format(out_path)
-        self._apply_index_style(layer, rp["def"]["key"])
-        QgsProject.instance().addMapLayer(layer)
-        msg = "Рассчитан {}: {}".format(rp["def"]["label"], out_path)
-        if downsampled:
-            msg += " (грид уменьшен до {} px по большой стороне)".format(INDEX_MAX_SIDE)
-        return True, msg
+            return False, "Расчёт индекса не удался (код {}).".format(res), None
+        return True, "", {
+            "kind": "index",
+            "out_path": out_path,
+            "key": rp["def"]["key"],
+            "label": rp["def"]["label"],
+            "name": "{} · {}".format(rp["def"]["label"], self._layer_name(meta)),
+            "downsampled": downsampled,
+        }
 
     @staticmethod
     def _apply_index_style(layer, index_key):
@@ -371,6 +506,44 @@ def _cumcut(dp, band):
     if len(nums) >= 2:
         return nums[-2], nums[-1]
     raise ValueError("cumulativeCut вернул {}".format(res))
+
+
+def _ds_percentiles(ds, band_no, buf=512):
+    """(2%, 98%) перцентили канала из прореженного окна 512×512.
+
+    GDAL при уменьшенном чтении сам использует обзорные уровни COG, поэтому
+    трафик — единицы блоков вместо всего канала. Считается в фоновом потоке;
+    результат подставляется в QgsContrastEnhancement без обращения к сети
+    в GUI-потоке. None — если статистику получить не удалось (тогда в
+    finish_layer будет fallback на cumulativeCut локального файла).
+    """
+    try:
+        import numpy as np
+    except ImportError:  # pragma: no cover - numpy есть в любой поставке QGIS
+        return None
+    try:
+        b = ds.GetRasterBand(int(band_no))
+        if b is None:
+            return None
+        try:  # GDAL 3.x: snake_case
+            arr = b.ReadAsArray(buf_xsize=buf, buf_ysize=buf)
+        except TypeError:  # старые биндинги: CamelCase
+            arr = b.ReadAsArray(bufXSize=buf, bufYSize=buf)
+        if arr is None:
+            return None
+        a = np.asarray(arr, dtype="float64")
+        nodata = b.GetNoDataValue()
+        if nodata is not None:
+            a = a[a != float(nodata)]
+        a = a[np.isfinite(a)]
+        if a.size == 0:
+            return None
+        mn, mx = np.percentile(a, (2.0, 98.0))
+        if not (mx > mn):
+            return None
+        return float(mn), float(mx)
+    except Exception:  # noqa: BLE001 - нет статистики — не критично
+        return None
 
 
 def _safe_name(s):

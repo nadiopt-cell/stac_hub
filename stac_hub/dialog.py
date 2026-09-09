@@ -9,6 +9,7 @@
 
 import datetime as _dt
 import webbrowser
+from collections import deque
 
 from qgis.PyQt.QtCore import Qt, QObject, QRunnable, QThreadPool, QSize, pyqtSignal
 from qgis.PyQt.QtGui import QIcon, QPixmap
@@ -37,6 +38,10 @@ class SearchSignals(QObject):
 
 class ThumbSignals(QObject):
     ready = pyqtSignal(object, bytes)  # meta-словарь айтема, данные изображения
+
+
+class BuildSignals(QObject):
+    built = pyqtSignal(object)  # результат подготовки слоя: {ok, msg, payload, name}
 
 
 class SearchWorker(QRunnable):
@@ -103,7 +108,10 @@ class SearchWorker(QRunnable):
                 metas.append(stac_client.normalize(it, self.source))
             except Exception:  # noqa: BLE001
                 continue
-        self.dialog.search_signals.done.emit(self.source["id"], metas, errors)
+        try:
+            self.dialog.search_signals.done.emit(self.source["id"], metas, errors)
+        except RuntimeError:
+            pass  # диалог уже закрыт — слоты уничтожены, тихо выходим
 
 
 class ThumbWorker(QRunnable):
@@ -127,6 +135,38 @@ class ThumbWorker(QRunnable):
             self.dialog.thumb_signals.ready.emit(self.meta, data)
         except RuntimeError:
             pass  # диалог уже закрыт — слоты уничтожены, тихо выходим
+
+
+class LayerBuildWorker(QRunnable):
+    """Подготовка слоя в фоне (сеть/GDAL/расчёт индекса) — QGIS не замерзает.
+
+    Финализация (QgsRasterLayer + QgsProject) выполняется в GUI-потоке
+    через сигнал built -> StacHubDialog._layer_built.
+    """
+
+    def __init__(self, dialog, plugin, meta, preset, creds, canvas):
+        super().__init__()
+        self.dialog = dialog
+        self.plugin = plugin
+        self.meta = meta
+        self.preset = preset
+        self.creds = creds
+        self.canvas = canvas  # (extent, crs, transform_context) либо (None, None, None)
+        self.setAutoDelete(True)
+
+    def run(self):
+        try:
+            ok, msg, payload = self.plugin.prepare_layer(
+                self.meta, self.preset, self.creds, *(self.canvas or (None, None, None)))
+        except Exception as exc:  # noqa: BLE001 - страховка на любом сбое
+            ok, msg, payload = False, "Ошибка подготовки слоя: {}".format(exc), None
+        try:
+            self.dialog.build_signals.built.emit({
+                "ok": ok, "msg": msg, "payload": payload,
+                "name": (payload or {}).get("name") or "",
+            })
+        except RuntimeError:
+            pass  # диалог уже закрыт во время построения
 
 
 class CredentialsDialog(QDialog):
@@ -252,14 +292,19 @@ class StacHubDialog(QDialog):
         self.plugin = plugin
         self.iface = plugin.iface
         self.auth_store = AuthStore()
-        self.pool = QThreadPool.globalInstance()
-        self.pool.setMaxThreadCount(8)
+        # ОТДЕЛЬНЫЙ пул плагина (не глобальный!): раньше ставили 8 потоков
+        # глобальному пулу QGIS и делали clear() при «Стоп» — это сносило
+        # отложенные задачи самого QGIS и голодало их, интерфейс подвисал.
+        self.pool = QThreadPool(self)
+        self.pool.setMaxThreadCount(6)
         self.cancelled = False
         self._pending = 0
         self._thumb_items = {}
-        self._thumb_queue = []      # очередь миниатюр: сглаживает нагрузку на сеть/GIL
+        self._thumb_queue = deque()  # очередь миниатюр: O(1) вместо pop(0)
         self._thumb_active = 0
         self.THUMB_PARALLEL = 2
+        self._building = False       # идёт фоновое построение слоя
+        self._build_worker = None
         # общие долгоживущие сигналы: владельцем является диалог —
         # объекты не умирают вместе с autoDelete-раннерблами
         self._workers = []
@@ -267,6 +312,8 @@ class StacHubDialog(QDialog):
         self.search_signals.done.connect(self._search_done)
         self.thumb_signals = ThumbSignals()
         self.thumb_signals.ready.connect(self.thumb_ready)
+        self.build_signals = BuildSignals()
+        self.build_signals.built.connect(self._layer_built)
 
         self.setWindowTitle("STAC Hub — открытые геоданные")
         self.resize(1180, 720)
@@ -542,7 +589,7 @@ class StacHubDialog(QDialog):
 
     def stop_search(self):
         self.cancelled = True
-        self.pool.clear()
+        self.pool.clear()  # очищаем ТОЛЬКО свой пул (глобальный трогать нельзя)
         self.btn_stop.setEnabled(False)
         self.btn_search.setEnabled(True)
         self.status.setText("Остановлено.")
@@ -590,7 +637,7 @@ class StacHubDialog(QDialog):
         """Запускает загрузку миниатюр с ограничением параллелизма."""
         while (self._thumb_queue and self._thumb_active < self.THUMB_PARALLEL
                and not self.cancelled):
-            meta, url = self._thumb_queue.pop(0)
+            meta, url = self._thumb_queue.popleft()
             self._thumb_active += 1
             tw = ThumbWorker(self, meta, url)
             self._workers.append(tw)
@@ -664,9 +711,30 @@ class StacHubDialog(QDialog):
             QMessageBox.warning(self, "STAC Hub",
                                 "У айтема нет доступного растрового ассета (только метаданные).")
             return
-        name = "{} · {}".format(meta["collection"] or meta["source_name"], meta["date"])
-        creds = self.auth_store.get(meta["source_id"])
+        if self._building:
+            self.status.setText("Слой ещё строится в фоне — подождите несколько секунд…")
+            return
         preset = self.render_combo.currentData() or "plain"
+        creds = self.auth_store.get(meta["source_id"])
+        fn_prepare = getattr(self.plugin, "prepare_layer", None)
+        fn_ctx = getattr(self.plugin, "canvas_build_context", None)
+        if fn_prepare is None or fn_ctx is None:
+            # старый/фейковый плагин без prepare/finish — прежний синхронный путь
+            self._add_layer_sync(meta, preset, creds)
+            return
+        # асинхронный путь: тяжёлая работа в пуле плагина, финал — в GUI-потоке
+        self._building = True
+        self.btn_add.setEnabled(False)
+        self.status.setText("Строим слой ({}) в фоне — интерфейс остаётся доступным…".format(
+            self.render_combo.currentText()))
+        canvas = fn_ctx()  # экстент/CRS/контекст — только из GUI-потока
+        worker = LayerBuildWorker(self, self.plugin, meta, preset, creds, canvas)
+        self._build_worker = worker
+        self._workers.append(worker)
+        self.pool.start(worker)
+
+    def _add_layer_sync(self, meta, preset, creds):
+        name = "{} · {}".format(meta["collection"] or meta["source_name"], meta["date"])
         self.status.setText("Строим слой ({})…".format(self.render_combo.currentText()))
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
@@ -679,6 +747,25 @@ class StacHubDialog(QDialog):
             QApplication.restoreOverrideCursor()
         if ok:
             self.status.setText("Слой добавлен: {}".format(msg or name))
+        else:
+            self.status.setText("Не удалось добавить слой. {}".format(msg))
+
+    def _layer_built(self, res):
+        """Финал построения слоя — выполняется в GUI-потоке (сигнал built)."""
+        self._building = False
+        self._build_worker = None
+        self.btn_add.setEnabled(True)
+        if not res.get("ok"):
+            self.status.setText("Не удалось добавить слой. {}".format(res.get("msg") or ""))
+            return
+        payload = res.get("payload")
+        fin = getattr(self.plugin, "finish_layer", None)
+        if payload is None or fin is None:
+            self.status.setText("Слой добавлен: {}".format(res.get("name") or ""))
+            return
+        ok, msg = fin(payload)
+        if ok:
+            self.status.setText("Слой добавлен: {}".format(msg or res.get("name") or ""))
         else:
             self.status.setText("Не удалось добавить слой. {}".format(msg))
 

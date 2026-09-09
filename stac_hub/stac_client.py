@@ -15,6 +15,7 @@ import base64
 import json
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 try:
     import requests
@@ -26,17 +27,45 @@ TIMEOUT = 30
 THUMB_TIMEOUT = 8
 THUMB_MAX_BYTES = 2 * 1024 * 1024
 
-# общая сессия для мелких запросов (миниатюры): переиспользует соединения
-_SESSION = None
+_TLS = threading.local()
+
+
+def _new_session():
+    """Session с пулом соединений и ретраями на сетевые ошибки.
+
+    Переиспользование TLS-соединений экономит 0.5–2 с на каждом запросе
+    (раньше каждый запрос открывал новое соединение).
+    """
+    s = requests.Session()
+    s.headers.update({"User-Agent": USER_AGENT})
+    try:
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+        retry = Retry(total=2, connect=2, read=1, backoff_factor=0.5,
+                      status_forcelist=(429, 500, 502, 503, 504),
+                      allowed_methods=frozenset(("GET", "POST")))
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=8)
+        s.mount("https://", adapter)
+        s.mount("http://", adapter)
+    except Exception:  # noqa: BLE001 - старый urllib3: работаем без ретраев
+        pass
+    return s
+
+
+def _session():
+    """Thread-local requests.Session: по одной на поток, соединения переиспользуются."""
+    if requests is None:
+        return None
+    s = getattr(_TLS, "session", None)
+    if s is None:
+        s = _new_session()
+        _TLS.session = s
+    return s
 
 
 def _thumb_session():
-    global _SESSION
-    if _SESSION is None:
-        import requests as _r
-        _SESSION = _r.Session()
-        _SESSION.headers.update({"User-Agent": USER_AGENT})
-    return _SESSION
+    """Совместимость: миниатюры ходят через общую thread-local сессию."""
+    return _session()
 
 IMAGE_MIME_HINTS = ("tiff", "geotiff", "image/tiff", "image/jp2", "image/x.hdf", "image/nitf", "nitf")
 SKIP_EXT = (".json", ".xml", ".txt", ".md", ".jpg", ".jpeg", ".png", ".gif", ".html", ".yml", ".yaml")
@@ -219,8 +248,9 @@ def search_api(source, user_bbox=None, dt_param=None, collections=None, limit=30
     headers = build_headers(source, creds)
     if extra_headers:
         headers.update(extra_headers)
+    sess = _session()
     try:
-        r = requests.post(url, json=body, headers=headers, timeout=timeout)
+        r = sess.post(url, json=body, headers=headers, timeout=timeout)
     except Exception as exc:  # noqa: BLE001 - сеть/таймаут/прокси
         return [], str(exc)
     if r.status_code in (403, 405):
@@ -233,7 +263,7 @@ def search_api(source, user_bbox=None, dt_param=None, collections=None, limit=30
         if collections:
             params["collections"] = ",".join(collections)
         try:
-            r = requests.get(url, params=params, headers=headers, timeout=timeout)
+            r = sess.get(url, params=params, headers=headers, timeout=timeout)
         except Exception as exc:  # noqa: BLE001
             return [], str(exc)
     if r.status_code != 200:
@@ -255,20 +285,31 @@ def search_cmr_providers(source, providers, user_bbox=None, dt_param=None,
                          timeout=TIMEOUT):
     """Поиск по нескольким провайдерам NASA CMR-STAC.
 
+    Провайдеры опрашиваются ПАРАЛЛЕЛЬНО (до 4 потоков): раньше 5 провайдеров
+    шли строго друг за другом и глобальный поиск растягивался на минуты.
     Возвращает (items, errors) — items объединены и отсортированы по дате.
     """
-    all_items, errors = [], []
-    for prov in providers:
+    def _one(prov):
         sub = dict(source)
         sub["url"] = CMR_PROVIDER_URL.format(prov=prov)
         cols = (collections_by_provider or {}).get(prov)
         # CMR возвращает айтемы без облачности; лимит на провайдера умеренный
         items, err = search_api(sub, user_bbox, dt_param, cols, limit, creds, timeout=timeout)
-        if err:
-            errors.append("{}: {}".format(prov, err))
         for it in items:
             it["_cmr_provider"] = prov
+        return items, ("{}: {}".format(prov, err) if err else None)
+
+    providers = list(providers or [])
+    if len(providers) > 1:
+        with ThreadPoolExecutor(max_workers=min(4, len(providers))) as ex:
+            results = list(ex.map(_one, providers))
+    else:
+        results = [_one(p) for p in providers]
+    all_items, errors = [], []
+    for items, err in results:
         all_items.extend(items)
+        if err:
+            errors.append(err)
     all_items.sort(key=lambda it: item_datetime(it) or "", reverse=True)
     return all_items, errors
 
@@ -281,10 +322,31 @@ CMR_PROVIDER_URL = "https://cmr.earthdata.nasa.gov/stac/{prov}/search"
 # --------------------------------------------------------------------------
 def _get_json(url, creds, timeout=TIMEOUT):
     headers = build_headers(source=None, creds=creds)
-    r = requests.get(url, headers=headers, timeout=timeout)
+    r = _session().get(url, headers=headers, timeout=timeout)
     if r.status_code != 200:
         raise RuntimeError("HTTP {} {}".format(r.status_code, url[-80:]))
     return r.json()
+
+
+def _fetch_json_many(hrefs, creds, timeout, workers=4):
+    """Параллельная подгрузка JSON-документов (айтемы статических каталогов).
+
+    Возвращает [(href, doc|None, ошибка|None)] в ИСХОДНОМ порядке (map сохраняет
+    порядок): раньше до ~140 айтемов качались строго по одному — обход
+    Vantor/Maxar/Umbra растягивался на минуты.
+    """
+    hrefs = list(hrefs)
+    if not hrefs:
+        return []
+
+    def _one(url):
+        try:
+            return url, _get_json(url, creds, timeout), None
+        except Exception as exc:  # noqa: BLE001 - один битый айтем не срывает обход
+            return url, None, str(exc)
+
+    with ThreadPoolExecutor(max_workers=min(workers, len(hrefs))) as ex:
+        return list(ex.map(_one, hrefs))
 
 
 def _absolutize(base_url, href):
@@ -377,20 +439,24 @@ def walk_static(source, user_bbox=None, dt_pair=None, max_cloud=None,
                 items.append(doc)
             continue
         # каталог или коллекция: идём вглубь
+        item_hrefs, child_hrefs = [], []
         for rel, href in _iter_children(doc, url):
             if rel == "item":
-                if len(items) >= max_items:
+                if len(item_hrefs) >= max(1, max_items - len(items)):
                     break
-                try:
-                    it = _get_json(href, creds, timeout)
-                except Exception as exc:  # noqa: BLE001
-                    warnings.append(str(exc))
-                    continue
-                absolutize_item_assets(it, href)
-                if item_passes(it, user_bbox, dt_pair, max_cloud):
-                    items.append(it)
+                item_hrefs.append(href)
             else:
-                queue.append((href, lvl + 1))
+                child_hrefs.append((href, lvl + 1))
+        for href, it, exc in _fetch_json_many(item_hrefs, creds, timeout):
+            if len(items) >= max_items:
+                break
+            if exc:
+                warnings.append(exc)
+                continue
+            absolutize_item_assets(it, href)
+            if item_passes(it, user_bbox, dt_pair, max_cloud):
+                items.append(it)
+        queue.extend(child_hrefs)
         if truncated:
             break
     if truncated:
@@ -494,8 +560,7 @@ def get_mpc_token(collection, timeout=15):
     token = ""
     if requests is not None:
         try:
-            r = requests.get(MPC_SAS_URL.format(collection),
-                             headers={"User-Agent": USER_AGENT}, timeout=timeout)
+            r = _session().get(MPC_SAS_URL.format(collection), timeout=timeout)
             if r.status_code == 200:
                 token = (r.json() or {}).get("token") or ""
         except Exception:  # noqa: BLE001 - сеть/таймаут
