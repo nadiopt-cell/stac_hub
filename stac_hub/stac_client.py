@@ -72,6 +72,24 @@ def build_headers(source, creds):
     return headers
 
 
+def curl_robust_options():
+    """Опции GDAL для устойчивого чтения /vsicurl/ через CDN/Azure.
+
+    Симптом, который лечим: «ReadBlock failed ... TIFFReadEncodedFile() failed»
+    при отрисовке COG (обрывы range-запросов). Крупный чанк — меньше запросов,
+    ретраи по сетевым кодам, HTTP/1.1 (обход обрывов HTTP/2 у части CDN).
+    """
+    return {
+        "GDAL_HTTP_MAX_RETRY": "8",
+        "GDAL_HTTP_RETRY_CODES": "408,429,500,502,503,504",
+        "GDAL_HTTP_CONNECTTIMEOUT": "20",
+        "GDAL_HTTP_TIMEOUT": "180",
+        "GDAL_HTTP_VERSION": "1.1",
+        "CPL_VSIL_CURL_CHUNK_SIZE": "1048576",
+        "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
+    }
+
+
 def gdal_auth_options(creds):
     """Опции GDAL для /vsicurl/ при загрузке защищённых ассетов.
 

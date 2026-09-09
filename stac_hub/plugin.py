@@ -345,9 +345,13 @@ class StacHubPlugin(object):
 
     # ------------------------------------------------------------- прочее
     def _apply_gdal_auth(self, creds):
-        if gdal is not None and creds:
-            for key, value in stac_client.gdal_auth_options(creds).items():
+        if gdal is not None:
+            # устойчивые настройки HTTP — на каждую загрузку слоя (глобальны на сессию)
+            for key, value in stac_client.curl_robust_options().items():
                 gdal.SetConfigOption(key, value)
+            if creds:
+                for key, value in stac_client.gdal_auth_options(creds).items():
+                    gdal.SetConfigOption(key, value)
 
     @staticmethod
     def _layer_name(meta):
