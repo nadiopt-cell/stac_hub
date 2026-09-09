@@ -15,7 +15,7 @@ about=STAC Hub — единая точка доступа к открытым г
 Источники: EarthSearch (Element 84), USGS LandsatLook, Copernicus Data Space, Terrascope, Microsoft Planetary Computer, NASA CMR-STAC (61 провайдер), Vantor Open Data, Maxar Open Data (архив), Umbra Open Data, Digital Earth Africa, Digital Earth Australia, Brazil Data Cube.
 
 Совместимость: QGIS 3.22–3.4x (PyQt5). Проверки источников выполнены 09.09.2026.
-version=0.1.0
+version=0.1.1
 author=nadiopt-cell
 email=nadiopt-cell@users.noreply.github.com
 

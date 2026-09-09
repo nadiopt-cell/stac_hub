@@ -90,7 +90,12 @@ class SearchWorker(QRunnable):
                     self.limit, creds, timeout=timeout)
         except Exception as exc:  # noqa: BLE001 - любые ошибки сети в фоне
             items, errors = [], [str(exc)]
-        errors = errors or []
+        # search_api возвращает строку ошибки, search_cmr_providers/walk_static —
+        # список; сигнал done(str, list, list) требует список — нормализуем.
+        if errors is None:
+            errors = []
+        elif isinstance(errors, str):
+            errors = [errors]
         metas = []
         for it in items:
             try:
@@ -471,9 +476,9 @@ class StacHubDialog(QDialog):
         if src:
             auth_html = "<br/>" + src["auth_note"] if src.get("auth_note") else ""
             self.info.setText(
-                "<b>{}</b> — оператор: <b>{}</b><br/>"
+                "<b>{1}</b> — оператор: <b>{2}</b><br/>"
                 "Каталог STAC: <a href='{0}'>{0}</a><br/>"
-                "Доступ: {} · Лицензия: {} · Охват: {}{}".format(
+                "Доступ: {3} · Лицензия: {4} · Охват: {5}{6}".format(
                     src["url"], src["name"], src["operator"],
                     src["access"], src.get("license", "—"), src["coverage"], auth_html))
 
