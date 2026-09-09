@@ -301,8 +301,12 @@ class StacHubPlugin(object):
             entries.append(e)
         calc = QgsRasterCalculator(expr, out_path, "GTiff", extent, base.crs(),
                                    ncols, nrows, entries)
-        res = calc.run()
-        if res != 0:
+        # QGIS 3.x: processCalculation(); страховка для нестандартных сборок
+        runner = getattr(calc, "processCalculation", None) or getattr(calc, "run", None)
+        if runner is None:
+            return False, "QGIS не предоставляет API расчёта растровых выражений."
+        res = runner()
+        if res != getattr(QgsRasterCalculator, "Success", 0):
             return False, "Расчёт индекса не удался (код {}).".format(res)
         name = "{} · {}".format(rp["def"]["label"], self._layer_name(meta))
         layer = QgsRasterLayer(out_path, name, "gdal")
