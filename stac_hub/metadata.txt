@@ -4,7 +4,7 @@ qgisMinimumVersion=3.22
 qgisMaximumVersion=3.99
 description=Поиск и стриминг открытых геоданных через STAC: 12 каталогов (NASA, EarthSearch, Planetary Computer, Copernicus, Vantor/Maxar и др.) в одном окне.
 about=STAC Hub — единая точка доступа к открытым геоданным по протоколу STAC. · Возможности: · - 12 проверенных каталогов + 76 флагманских наборов NASA CMR-STAC, сгруппированные по категориям (космоснимки, рельеф, климат, океан, лёд, SAR, события...) и по охвату; · - глобальный поиск сразу по всем выбранным источникам (bbox, интервал дат, облачность); · - загрузка растров в проект через /vsicurl/ (COG-стриминг без скачивания файла); · - учётные данные (Basic / Bearer / произвольный заголовок) там, где они нужны: NASA Earthdata Login, Copernicus Data Space, Terrascope, Planetary Computer; · - миниатюры снимков в результатах и информация о происхождении каждого слоя (оператор, каталог, лицензия). · Источники: EarthSearch (Element 84), USGS LandsatLook, Copernicus Data Space, Terrascope, Microsoft Planetary Computer, NASA CMR-STAC (61 провайдер), Vantor Open Data, Maxar Open Data (архив), Umbra Open Data, Digital Earth Africa, Digital Earth Australia, Brazil Data Cube. · Совместимость: QGIS 3.22–3.4x (PyQt5). Проверки источников выполнены 09.09.2026.
-version=0.1.2
+version=0.1.3
 author=nadiopt-cell
 email=nadiopt-cell@users.noreply.github.com
 

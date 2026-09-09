@@ -13,6 +13,8 @@
 
 import base64
 import json
+import threading
+import time
 
 try:
     import requests
@@ -447,6 +449,94 @@ def pick_thumbnail(item):
     return None
 
 
+# --------------------------------------------------------------------------
+# SAS-подпись ссылок Microsoft Planetary Computer
+# --------------------------------------------------------------------------
+MPC_SAS_URL = "https://planetarycomputer.microsoft.com/api/sas/v1/token/{}"
+_SAS_CACHE = {}          # коллекция -> (token, время получения)
+_SAS_LOCK = threading.Lock()
+_SAS_TTL = 45 * 60       # реальный срок жизни ~1 ч, обновляем заранее
+
+
+def mpc_needs_signing(href):
+    """True для ссылок на хранилища MPC (Azure blob) без подписи (409 без токена)."""
+    h = (href or "").lower()
+    return "core.windows.net" in h or "azureedge.net" in h
+
+
+def get_mpc_token(collection, timeout=15):
+    """SAS-токен коллекции MPC (анонимно, кэш 45 мин). '' при ошибке."""
+    if not collection:
+        return ""
+    now = time.time()
+    with _SAS_LOCK:
+        hit = _SAS_CACHE.get(collection)
+        if hit and now - hit[1] < _SAS_TTL:
+            return hit[0]
+    token = ""
+    if requests is not None:
+        try:
+            r = requests.get(MPC_SAS_URL.format(collection),
+                             headers={"User-Agent": USER_AGENT}, timeout=timeout)
+            if r.status_code == 200:
+                token = (r.json() or {}).get("token") or ""
+        except Exception:  # noqa: BLE001 - сеть/таймаут
+            token = ""
+    if token:
+        with _SAS_LOCK:
+            _SAS_CACHE[collection] = (token, now)
+    return token
+
+
+def sign_url(href, collection):
+    """Добавляет SAS-подпись MPC к blob-ссылкам; остальные — без изменений."""
+    if not href or not mpc_needs_signing(href):
+        return href
+    token = get_mpc_token(collection)
+    if not token:
+        return href
+    return href + ("&" if "?" in href else "?") + token
+
+
+def sign_item_assets(item, collection=None):
+    """Подписывает href ассетов айтема MPC (миниатюры/COG без подписи отдают 409)."""
+    coll = collection or item.get("collection") or ""
+    for a in (item.get("assets") or {}).values():
+        href = a.get("href") or ""
+        if mpc_needs_signing(href):
+            a["href"] = sign_url(href, coll)
+
+
+def asset_bands(asset):
+    """Список common_name каналов ассета из eo:bands."""
+    out = []
+    for b in asset.get("eo:bands") or []:
+        if isinstance(b, dict):
+            nm = b.get("common_name") or b.get("name") or ""
+            if nm:
+                out.append(str(nm))
+    return out
+
+
+def raster_asset_map(item):
+    """Растровые ассеты айтема: {ключ: {href, type, roles, bands}}.
+
+    Используется для пресетов синтеза (render_presets): содержит все
+    канальные ассеты (B04, B08, sr_b5...), а не только выбранный pick_asset.
+    """
+    out = {}
+    for k, a in (item.get("assets") or {}).items():
+        bands = asset_bands(a)
+        if bands or _is_raster_asset(k, a):
+            out[k] = {
+                "href": a.get("href") or "",
+                "type": a.get("type") or "",
+                "roles": list(a.get("roles") or []),
+                "bands": bands,
+            }
+    return out
+
+
 def item_gsd(item):
     props = item.get("properties") or {}
     for key in ("gsd", "eo:gsd", "pan_gsd"):
@@ -487,6 +577,7 @@ def normalize(item, source, provider=None):
         "asset_mime": (asset or {}).get("type") or "",
         "thumb_url": pick_thumbnail(item),
         "self_url": item_self_url(item),
+        "assets": raster_asset_map(item),
     }
 
 

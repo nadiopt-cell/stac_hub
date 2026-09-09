@@ -20,6 +20,7 @@ from qgis.PyQt.QtWidgets import (
 )
 
 from . import stac_client
+from . import render_presets
 from .sources import SOURCES, CATEGORIES, COVERAGE_GROUPS, get_source
 from .auth_store import AuthStore
 
@@ -119,7 +120,9 @@ class ThumbWorker(QRunnable):
         if self.dialog.cancelled or not self.url:
             data = b""  # пустой сигнал всё равно освобождает слот очереди
         else:
-            data = stac_client.fetch_thumbnail(self.url) or b""
+            # миниатюры MPC лежат в Azure blob — нужна SAS-подпись (иначе 409)
+            url = stac_client.sign_url(self.url, (self.meta or {}).get("collection") or "")
+            data = stac_client.fetch_thumbnail(url) or b""
         self.dialog.thumb_signals.ready.emit(self.meta, data)
 
 
@@ -374,6 +377,18 @@ class StacHubDialog(QDialog):
         self.results.customContextMenuRequested.connect(self._results_menu)
         self.results.itemSelectionChanged.connect(self._on_result_selected)
         rlay.addWidget(self.results)
+        # строка выбора отображения: RGB-синтезы и спектральные индексы
+        rend = QHBoxLayout()
+        rend.addWidget(QLabel("Отображение:"))
+        self.render_combo = QComboBox()
+        self.render_combo.setToolTip(
+            "RGB-синтезы и спектральные индексы для выбранного снимка. "
+            "Индексы считаются по текущему экстенту карты.")
+        rend.addWidget(self.render_combo, 1)
+        self.btn_add = QPushButton("Добавить слой")
+        self.btn_add.clicked.connect(self.add_selected_to_project)
+        rend.addWidget(self.btn_add)
+        rlay.addLayout(rend)
         self.info = QLabel("Выберите источник слева — здесь появятся сведения о происхождении данных.")
         self.info.setWordWrap(True)
         self.info.setStyleSheet("color:#444; padding:4px;")
@@ -611,6 +626,13 @@ class StacHubDialog(QDialog):
                 meta.get("asset_mime") or "—", asset[:110],
                 meta.get("self_url") or (asset or "#"),
                 "" if not asset else " · <a href='{}'>COG-ссылка</a>".format(asset)))
+        # доступные для этого снимка синтезы/индексы
+        self.render_combo.blockSignals(True)
+        self.render_combo.clear()
+        for key, label in render_presets.menu_options(meta.get("assets") or {}):
+            self.render_combo.addItem(label, key)
+        self.render_combo.setCurrentIndex(0)
+        self.render_combo.blockSignals(False)
 
     def _results_menu(self, pos):
         meta = self._selected_meta()
@@ -640,10 +662,22 @@ class StacHubDialog(QDialog):
                                 "У айтема нет доступного растрового ассета (только метаданные).")
             return
         name = "{} · {}".format(meta["collection"] or meta["source_name"], meta["date"])
-        ok, msg = self.plugin.add_cog_layer(
-            meta["asset_url"], name, self.auth_store.get(meta["source_id"]))
-        self.status.setText("Слой добавлен: {}".format(name) if ok
-                            else "Не удалось добавить слой. {}".format(msg))
+        creds = self.auth_store.get(meta["source_id"])
+        preset = self.render_combo.currentData() or "plain"
+        self.status.setText("Строим слой ({})…".format(self.render_combo.currentText()))
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            fn = getattr(self.plugin, "add_rendered_layer", None)
+            if fn is not None:
+                ok, msg = fn(meta, preset, creds)
+            else:  # упрощённая заглушка (тесты) — ассет как есть
+                ok, msg = self.plugin.add_cog_layer(meta["asset_url"], name, creds)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if ok:
+            self.status.setText("Слой добавлен: {}".format(msg or name))
+        else:
+            self.status.setText("Не удалось добавить слой. {}".format(msg))
 
     # ------------------------------------------------------------ bbox
     def current_bbox(self):
